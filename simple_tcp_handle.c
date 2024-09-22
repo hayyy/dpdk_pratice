@@ -1041,6 +1041,7 @@ static struct ng_tcp_table *tcpListenInstance(void) {
 static struct ng_tcp_stream *ng_tcp_stream_create(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
 	struct ng_tcp_stream *stream = rte_malloc("ng_tcp_stream", sizeof(struct ng_tcp_stream), 0);
 	if (stream == NULL) {
+        printf("ng_tcp_stream_create rte_malloc ng_tcp_stream fail\n");
 		return NULL;
 	}
 
@@ -1055,14 +1056,16 @@ static struct ng_tcp_stream *ng_tcp_stream_create(uint32_t sip, uint32_t dip, ui
 	stream->status = NG_TCP_STATUS_LISTEN;
 
 	//对于名字相同的ring_buffer无法再次创建
-	stream->rcvbuffer = rte_ring_create("tcp recv buffer", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+	char bufname[32] = {0};
+    sprintf(bufname, "recv-buffer-%d-%d", sip, sport);
+	stream->rcvbuffer = rte_ring_create(bufname, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
 	if (stream->rcvbuffer == NULL) {
 		rte_free(stream);
 		printf("ng_tcp_stream_create:rte_ring_create rcvbuffer fail\n");
 		return NULL;
 	}
-
-	stream->sndbuffer = rte_ring_create("tcp snd buffer", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+    sprintf(bufname, "snd-buffer-%d-%d", sip, sport);
+	stream->sndbuffer = rte_ring_create(bufname, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
 	if (stream->sndbuffer == NULL) {
 		rte_ring_free(stream->rcvbuffer);
 		rte_free(stream);
@@ -1290,10 +1293,8 @@ static int ng_tcp_handler_listen(struct ng_tcp_stream* stream, struct rte_tcp_hd
 	puts("ng_tcp_handler_listen");
 	if (tcphdr->tcp_flags & RTE_TCP_SYN_FLAG) {
 		if (stream->status == NG_TCP_STATUS_LISTEN) {
-			puts("ng_tcp_handler_listen-111");
 			struct ng_tcp_stream *syn = ng_tcp_stream_create(iphdr->src_addr, iphdr->dst_addr, tcphdr->src_port, tcphdr->dst_port);
 			if (syn == NULL) return -1;
-			puts("ng_tcp_handler_listen-222");
 			syn->fd = -1;
 			
 			struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
