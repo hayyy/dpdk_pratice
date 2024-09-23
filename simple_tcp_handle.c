@@ -1,5 +1,16 @@
 /*
- * 实现基于dpdk的tcp和udp简单收发包，没有实现包重组，流量控制和拥塞控制等
+ * 实现基于dpdk的tcp epoll收发包
+ * todo 边缘触发写事件  
+ *  1、tcp发送缓冲区由满到非满触发
+ *  2、第一次添加写事件触发，直接在nepoll_ctl中将事件加入就绪队列
+ * todo 水平触发 协议栈线程每个循环遍历所有连接，如果输入缓冲区有数据或者输出缓冲区由空间，则加入就绪队列
+ * todo 多个epoll(连接中加入epoll指针)
+ * todo 将listen状态的连接也加入哈希表，源ip和源端口都是0
+ * 
+ * epoll加锁：
+ * 1、就绪队列操作加自旋锁
+ * 2、epoll rbree操作加互斥锁
+ * 3、epoll_wait等待 条件变量+互斥锁(协议栈回调函数中判断应用程序处于等待时，使用条件变量唤醒)
  */
 
 #include <rte_eal.h>
@@ -16,6 +27,9 @@
 #include <rte_hash.h>
 #include <rte_jhash.h>
 #include <rte_ethdev.h>
+#include <sys/epoll.h>
+
+#include "rbtree.h"
 
 #define NUM_MBUFS (4096-1) // 内存池中 mbuf 的数量
 #define BURST_SIZE 32
@@ -94,6 +108,7 @@ struct offload {
 struct ng_tcp_table {
 	int count;
 	struct ng_tcp_stream *tcp_set;
+    struct eventpoll *ep;       //目前只支持一个epoll
 };
 
 #define TCP_OPTION_LEN 10
@@ -254,6 +269,41 @@ struct ng_tcp_fragment {
 	size_t length;
 };
 
+typedef struct {
+    ngx_rbtree_t                  rbtree;
+    ngx_rbtree_node_t             sentinel;
+} rbtree_t;
+
+//红黑树中的节点
+struct epitem {
+	ngx_rbtree_node_t rbn;
+
+    struct epitem *prev;
+	struct epitem *next;
+    
+	int rdy; //是否在就绪队列里
+	
+	int sockfd;
+	struct epoll_event event; 
+};
+
+struct eventpoll {
+	rbtree_t rbr;
+	int rbcnt;
+
+    //就绪链表
+	struct epitem *rdlist;
+	int rdnum;
+
+	int waiting;
+
+	pthread_mutex_t mtx; //rbtree update
+	pthread_spinlock_t lock; //rdlist update
+	
+	pthread_cond_t cond; //block for event
+	pthread_mutex_t cdmtx; //mutex for cond
+	
+};
 
 static struct inout_ring *rInst = NULL;
 static struct inout_ring * ringInstance(void) {
@@ -283,6 +333,8 @@ static struct ng_tcp_stream *get_tcp_stream_fromfd(int sockfd);
 static struct rte_hash *tcpHashFdInstance(void);
 static struct rte_hash *tcpHashTupleInstance(void);
 
+static int epoll_event_callback(struct eventpoll *ep, int sockfd, uint32_t event);
+static struct eventpoll* get_eventpoll(int epfd);
 
 
 static void ng_init_port(struct rte_mempool *mbuf_pool) {
@@ -1107,7 +1159,7 @@ static int ng_tcp_stream_delete(uint32_t sip, uint32_t dip, uint16_t sport,
 
 
 //往哈希表中插入五元组->tcp连接
-static int ng_tcp_stream_insert(uint32_t sip, uint32_t dip, uint16_t sport, 
+static int ng_tcp_stream_hash_insert(uint32_t sip, uint32_t dip, uint16_t sport, 
 											uint16_t dport, struct ng_tcp_stream *stream) {
 	struct rte_hash *tcp_hash_tuple_table = tcpHashTupleInstance();
 	struct tcp_conn_key conn_key = {0};
@@ -1158,6 +1210,9 @@ static int ng_tcp_handler_established(struct ng_tcp_stream* stream, struct rte_t
 	if (tcphdr->tcp_flags & RTE_TCP_PSH_FLAG) {
 		
 		ng_tcp_enqueue_recvbuffer(stream, tcphdr, tcplen);
+
+        struct ng_tcp_table *table = tcpListenInstance();
+        epoll_event_callback(table->ep, stream->fd, EPOLLIN);
 				
 		//ack pkt
 		int payloadlen = tcplen - (tcphdr->data_off >> 4) * 4;
@@ -1172,6 +1227,9 @@ static int ng_tcp_handler_established(struct ng_tcp_stream* stream, struct rte_t
 		stream->status = NG_TCP_STATUS_CLOSE_WAIT;
 		
 		ng_tcp_enqueue_recvbuffer(stream, tcphdr, tcplen);
+
+        struct ng_tcp_table *table = tcpListenInstance();
+        epoll_event_callback(table->ep, stream->fd, EPOLLIN);
 
 		//ack pkt
 		stream->rcv_next = stream->rcv_next + 1;
@@ -1281,6 +1339,9 @@ static int ng_tcp_handler_syn_rcvd(struct ng_tcp_stream* stream, struct rte_tcp_
 				LL_ADD(stream, listener->accept_list);
 				pthread_cond_signal(&listener->cond);
 				pthread_mutex_unlock(&listener->mutex);
+
+                struct ng_tcp_table *table = tcpListenInstance();
+                epoll_event_callback(table->ep, listener->fd, EPOLLIN);
 			}
 		}
 	}
@@ -1320,7 +1381,7 @@ static int ng_tcp_handler_listen(struct ng_tcp_stream* stream, struct rte_tcp_hd
 			
 			syn->status = NG_TCP_STATUS_SYN_RCVD;
 
-			ng_tcp_stream_insert(iphdr->src_addr, iphdr->dst_addr, tcphdr->src_port, tcphdr->dst_port, syn);
+			ng_tcp_stream_hash_insert(iphdr->src_addr, iphdr->dst_addr, tcphdr->src_port, tcphdr->dst_port, syn);
 			struct ng_tcp_stream *listener = ng_tcp_stream_search(0, 0, 0, stream->dport);
 			//加入半连接队列
 			LL_ADD(syn, listener->syn_list);
@@ -1536,6 +1597,365 @@ static int tcp_server_entry(__attribute__((unused)) void *arg) {
 	return 0;
 }
 
+static struct epitem *epitem_rbtree_lookup(ngx_rbtree_t *rbtree, int fd) {
+    ngx_rbtree_node_t  *node, *sentinel;
+
+    node = rbtree->root;
+    sentinel = rbtree->sentinel;
+
+    while (node != sentinel) {
+
+        if (fd != node->key) {
+            node = (fd < node->key) ? node->left : node->right;
+            continue;
+        }
+
+        return (struct epitem*)node;
+    }
+
+    return NULL;
+}
+
+static int epoll_event_callback(struct eventpoll *ep, int sockfd, uint32_t event) {
+	struct epitem *epi = epitem_rbtree_lookup(&ep->rbr.rbtree, sockfd);
+	if (!epi) {
+		printf("epoll_event_callback---rbtree not exist\n");
+		return -1;
+	}
+	if (epi->rdy) {
+		epi->event.events |= event;
+		return 1;
+	} 
+
+	printf("epoll_event_callback --> %d\n", epi->sockfd);
+    
+	pthread_spin_lock(&ep->lock);
+	epi->rdy = 1;
+	LL_ADD(epi, ep->rdlist);
+	ep->rdnum++;
+	pthread_spin_unlock(&ep->lock);
+
+	pthread_mutex_lock(&ep->cdmtx);
+    //epoll_wait陷入阻塞时才唤醒
+    if (ep->waiting == 1) {
+    	pthread_cond_signal(&ep->cond);
+    }
+	pthread_mutex_unlock(&ep->cdmtx);
+
+
+	return 0;
+}
+
+static void nepoll_destroy(struct eventpoll *ep) {
+
+	//remove rdlist
+	while (ep->rdlist != NULL) {
+		struct epitem *epi = ep->rdlist;
+		LL_REMOVE(epi, ep->rdlist);
+	}
+	
+	//remove rbtree
+	pthread_mutex_lock(&ep->mtx);
+	
+	for (;;) {
+		struct epitem *epi = (struct epitem *)ngx_rbtree_min(&ep->rbr.rbtree, &ep->rbr.sentinel);
+		if (epi == NULL) break;
+		
+		ngx_rbtree_delete(&ep->rbr.rbtree, &epi->rbn);
+		rte_free(epi);
+	}
+	pthread_mutex_unlock(&ep->mtx);
+}
+
+static int nepoll_close_socket(int epfd) {
+
+	struct eventpoll *ep = get_eventpoll(epfd);
+    if (ep == NULL) return -1;
+
+	nepoll_destroy(ep);
+
+	pthread_mutex_lock(&ep->mtx);
+	pthread_cond_signal(&ep->cond);
+	pthread_mutex_unlock(&ep->mtx);
+
+	pthread_cond_destroy(&ep->cond);
+	pthread_mutex_destroy(&ep->mtx);
+
+	pthread_spin_destroy(&ep->lock);
+
+	rte_free(ep);
+
+	return 0;
+}
+
+static int nepoll_create(int size) {
+    if (size <= 0) return -1;
+
+    int fd = get_fd_frombitmap();
+
+	struct eventpoll *ep = (struct eventpoll*)rte_malloc("eventpool", sizeof(struct eventpoll), 0);
+	if (!ep) {
+		set_fd_frombitmap(fd);
+		return -1;
+	}
+
+    memset(ep, 0, sizeof(struct eventpoll));
+
+	ngx_rbtree_init(&ep->rbr.rbtree, &ep->rbr.sentinel, ngx_rbtree_insert_value);
+
+	if (pthread_mutex_init(&ep->mtx, NULL)) {
+		rte_free(ep);
+		set_fd_frombitmap(fd);
+		return -2;
+	}
+
+	if (pthread_mutex_init(&ep->cdmtx, NULL)) {
+		pthread_mutex_destroy(&ep->mtx);
+		rte_free(ep);
+        set_fd_frombitmap(fd);
+		return -2;
+	}
+
+	if (pthread_cond_init(&ep->cond, NULL)) {
+		pthread_mutex_destroy(&ep->cdmtx);
+		pthread_mutex_destroy(&ep->mtx);
+		rte_free(ep);
+        set_fd_frombitmap(fd);
+		return -2;
+	}
+
+	if (pthread_spin_init(&ep->lock, PTHREAD_PROCESS_SHARED)) {
+		pthread_cond_destroy(&ep->cond);
+		pthread_mutex_destroy(&ep->cdmtx);
+		pthread_mutex_destroy(&ep->mtx);
+		rte_free(ep);
+        set_fd_frombitmap(fd);
+
+		return -2;
+	}
+
+	struct ng_tcp_table *table = tcpListenInstance();
+    table->ep = ep;
+    
+	return fd;
+}
+
+static struct eventpoll* get_eventpoll(__attribute__((unused)) int epfd) {
+    struct ng_tcp_table *table = tcpListenInstance();
+    return table->ep;
+}
+
+static int nepoll_ctl(int epfd, int op, int sockfd, struct epoll_event *event) {
+
+    struct eventpoll * ep = get_eventpoll(epfd);
+    if (ep == NULL || (!event && op != EPOLL_CTL_DEL)) return -1;
+
+	if (op == EPOLL_CTL_ADD) {
+
+		pthread_mutex_lock(&ep->mtx);
+		struct epitem *epi = epitem_rbtree_lookup(&ep->rbr.rbtree, sockfd);
+		if (epi) {
+			printf("rbtree is exist\n");
+			pthread_mutex_unlock(&ep->mtx);
+			return -1;
+		}
+
+		epi = (struct epitem*)rte_malloc("epitem", sizeof(struct epitem), 0);
+		if (!epi) {
+			pthread_mutex_unlock(&ep->mtx);
+			rte_errno = -ENOMEM;
+			return -1;
+		}
+
+        memset(epi, 0, sizeof(struct epitem));
+		
+		epi->sockfd = sockfd;
+        epi->rbn.key = sockfd;
+		memcpy(&epi->event, event, sizeof(struct epoll_event));
+
+		ngx_rbtree_insert(&ep->rbr.rbtree, &epi->rbn);
+		ep->rbcnt++;
+		
+		pthread_mutex_unlock(&ep->mtx);
+
+	} else if (op == EPOLL_CTL_DEL) {
+
+		pthread_mutex_lock(&ep->mtx);
+		struct epitem *epi = epitem_rbtree_lookup(&ep->rbr.rbtree, sockfd);
+		if (!epi) {
+			printf("rbtree no exist\n");
+			pthread_mutex_unlock(&ep->mtx);
+			return -1;
+		}
+		
+		ngx_rbtree_delete(&ep->rbr.rbtree, &epi->rbn);
+		ep->rbcnt --;
+		rte_free(epi);
+		
+		pthread_mutex_unlock(&ep->mtx);
+
+	} else if (op == EPOLL_CTL_MOD) {
+		struct epitem *epi = epitem_rbtree_lookup(&ep->rbr.rbtree, sockfd);
+		if (epi) {
+			epi->event.events = event->events;
+		} else {
+			rte_errno = -ENOENT;
+			return -1;
+		}
+
+	} else {
+		printf("op is no exist\n");
+        return -1;
+	}
+
+	return 0;
+}
+
+static int nepoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
+
+    struct eventpoll * ep = get_eventpoll(epfd);
+    if (ep == NULL || !events || maxevents < 0 ) return -1;
+
+    if (timeout != 0) {
+    	pthread_mutex_lock(&ep->cdmtx);
+    	while (ep->rdnum == 0) {
+    		ep->waiting = 1;
+    		if (timeout > 0) {
+
+    			struct timespec deadline;
+
+    			clock_gettime(CLOCK_REALTIME, &deadline);
+    			if (timeout >= 1000) {
+    				int sec;
+    				sec = timeout / 1000;
+    				deadline.tv_sec += sec;
+    				timeout -= sec * 1000;
+    			}
+
+    			deadline.tv_nsec += timeout * 1000000;
+
+    			if (deadline.tv_nsec >= 1000000000) {
+    				deadline.tv_sec++;
+    				deadline.tv_nsec -= 1000000000;
+    			}
+
+    			int ret = pthread_cond_timedwait(&ep->cond, &ep->cdmtx, &deadline);
+    			if (ret && ret != ETIMEDOUT) {
+    				printf("pthread_cond_timewait\n");
+    				pthread_mutex_unlock(&ep->cdmtx);
+    				
+    				return -1;
+    			}
+    			timeout = 0;
+    		} else if (timeout < 0) {
+
+    			int ret = pthread_cond_wait(&ep->cond, &ep->cdmtx);
+    			if (ret) {
+    				printf("pthread_cond_wait\n");
+    				pthread_mutex_unlock(&ep->cdmtx);
+
+    				return -1;
+    			}
+    		}
+    		ep->waiting = 0; 
+
+    	}
+
+    	pthread_mutex_unlock(&ep->cdmtx);
+    }
+
+	pthread_spin_lock(&ep->lock);
+
+	int cnt = 0;
+	int num = (ep->rdnum > maxevents ? maxevents : ep->rdnum);
+	int i = 0;
+	
+	while (num != 0 && ep->rdlist != NULL) { //EPOLLET
+
+		struct epitem *epi = ep->rdlist;
+		LL_REMOVE(epi, ep->rdlist);
+		epi->rdy = 0;
+
+		memcpy(&events[i++], &epi->event, sizeof(struct epoll_event));
+		
+		num --;
+		cnt ++;
+		ep->rdnum --;
+	}
+	
+	pthread_spin_unlock(&ep->lock);
+
+	return cnt;
+}
+
+static int tcp_server_epoll(__attribute__((unused)) void *arg) {
+	puts("tcp_server_epoll");
+
+	int listenfd = nsocket(AF_INET, SOCK_STREAM, 0);
+	if (listenfd == -1) {
+		printf("socket failed\n");
+		return -1;
+	}
+
+	struct sockaddr_in servaddr;
+	memset(&servaddr, 0, sizeof(struct sockaddr_in));
+
+	servaddr.sin_port = htons(8889);
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_addr.s_addr = gLocalIp;
+
+	if (nbind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+		puts("tcp_server_entry nbind fail");
+		return -1;
+	}
+
+	nlisten(listenfd, 10);
+
+	int epfd = nepoll_create(1);
+    if (epfd <= 0) {
+        puts("nepoll_create fail");
+		return -1;
+    }
+
+    struct epoll_event ev, events[128];
+    ev.events = EPOLLIN;
+    ev.data.fd = listenfd;
+    nepoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &ev);
+
+    while(1) {
+        int nready = nepoll_wait(epfd, events, 128, -1);
+        if (nready < 0) continue;
+
+        int i = 0;
+        for(i = 0; i < nready; i++) {
+            if (listenfd == events[i].data.fd) {
+                struct sockaddr_in clientaddr;
+                socklen_t len = sizeof(clientaddr);
+                int connfd = naccept(listenfd,(struct sockaddr*)&clientaddr,  &len);
+                ev.events = EPOLLIN;
+                ev.data.fd = connfd;
+                nepoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &ev);
+            } else {
+                char buffer[BUFFER_SIZE] = {0};
+                int connfd = events[i].data.fd;
+                int n = nrecv(connfd, buffer, BUFFER_SIZE, 0);
+                if (n > 0) {
+                    nsend(connfd, buffer, n, 0);
+                } else if (n == 0) {
+                    nepoll_ctl(epfd, EPOLL_CTL_DEL, connfd, NULL);
+                    nclose(connfd);
+                }
+            }
+        }
+
+    }
+
+	nclose(listenfd);
+
+	return 0;
+}
+
+
 // ifconfig vEth0 up 和 ifconfig vEth0 down 都走这个函数
 static int ng_config_network_if(uint16_t port_id, uint8_t if_up) {
 
@@ -1676,7 +2096,7 @@ int main(int argc, char *argv[]) {
 
 	unsigned tcp_thread_id = rte_get_next_lcore(udp_thread_id, 1, 0);
 	printf("tcp_thread_id:%d\n", tcp_thread_id);
-	rte_eal_remote_launch(tcp_server_entry, mbuf_pool, tcp_thread_id);
+	rte_eal_remote_launch(tcp_server_epoll, mbuf_pool, tcp_thread_id);
 
 	unsigned pkg_thread_id = rte_get_next_lcore(tcp_thread_id, 1, 0);
 	printf("pkg_thread_id:%d\n", pkg_thread_id);

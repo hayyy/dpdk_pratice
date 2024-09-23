@@ -5,7 +5,7 @@
 APP = simple_tcp_handle
 
 # all source are stored in SRCS-y
-SRCS-y := simple_tcp_handle.c
+SRCS-y := simple_tcp_handle.c rbtree.c
 
 # Build using pkg-config variables if possible
 ifeq ($(shell pkg-config --exists libdpdk && echo 0),0)
